@@ -104,7 +104,7 @@ class SkyPilotBackend(Backend):
             )
             print("Art server task already running, using it…")
         else:
-            art_server_task = sky.Task(name="art_server", run="uv run art")
+            art_server_task = sky.Task(name="art_server", run="art")
 
             clusters = await to_thread_typed(
                 lambda: sky.stream_and_get(
