@@ -38,6 +38,7 @@ backend = [
     "pytest>=8.4.1",
     "nbmake>=1.5.5",
     "gql<4",
+    "uvicorn>=0.34.0",
 ]
 
 skypilot = [
