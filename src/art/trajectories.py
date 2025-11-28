@@ -46,6 +46,28 @@ class Trajectory(pydantic.BaseModel):
     logs: list[str] = []
     start_time: datetime = pydantic.Field(default_factory=datetime.now, exclude=True)
 
+    @pydantic.field_validator('messages_and_choices', mode='before')
+    @classmethod
+    def reconstruct_choice_objects(cls, v: Any) -> Any:
+        """Reconstruct Choice objects from serialized dicts after deserialization."""
+        if not isinstance(v, list):
+            return v
+
+        result = []
+        for item in v:
+            # Check if this is a serialized Choice (has "message" key instead of "role")
+            if isinstance(item, dict) and "message" in item and "finish_reason" in item:
+                # Reconstruct as Choice object
+                try:
+                    result.append(Choice.model_validate(item))
+                except Exception:
+                    # If reconstruction fails, keep as dict
+                    result.append(item)
+            else:
+                # Regular message dict or already a Choice object
+                result.append(item)
+        return result
+
     def __init__(self, **data: Any):
         super().__init__(**data)
         self.start_time = datetime.now()
