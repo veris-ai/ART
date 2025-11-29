@@ -64,7 +64,7 @@ def trajectory_to_dict(trajectory: Trajectory) -> dict[str, Any]:
 def message_or_choice_to_dict(message_or_choice: MessageOrChoice) -> dict[str, Any]:
     # messages are sometimes stored as dicts, so we need to handle both cases
     item_dict = (
-        message_or_choice
+        dict(message_or_choice)  # Make a copy to avoid mutating the original dict
         if isinstance(message_or_choice, dict)
         else message_or_choice.to_dict()
     )

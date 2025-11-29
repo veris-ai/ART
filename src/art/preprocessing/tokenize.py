@@ -52,7 +52,7 @@ def tokenize_trajectory_groups(
     shuffle_group_trajectories: bool = True,
     image_processor: BaseImageProcessor | None = None,
 ) -> Generator["TokenizedResult", None, None]:
-    for group in trajectory_groups:
+    for group_idx, group in enumerate(trajectory_groups):
         if not group:
             continue
         results: list[TokenizedResult] = []
@@ -62,7 +62,7 @@ def tokenize_trajectory_groups(
             sum((trajectory.reward - reward_mean) ** 2 for trajectory in group)
             / len(group)
         )
-        for trajectory in group:
+        for traj_idx, trajectory in enumerate(group):
             # Calculate GRPO advantage for this trajectory
             advantage = trajectory.reward - reward_mean
             if scale_rewards:
@@ -139,16 +139,19 @@ def tokenize_trajectory(
     # Find the index of the last assistant message
     last_assistant_index = -1
     for i, message in enumerate(history.messages_and_choices):
-        if (
-            isinstance(message, dict)
-            and message["role"] == "assistant"
-            and allow_training_without_logprobs
-        ):
-            last_assistant_index = i
-        elif not isinstance(message, dict) and (
-            message.logprobs or allow_training_without_logprobs
-        ):
-            last_assistant_index = i
+        if isinstance(message, dict):
+            role = message.get("role")
+            has_logprobs = "logprobs" in message
+            logprobs_value = message.get("logprobs") if has_logprobs else None
+            is_assistant = role == "assistant"
+            condition_result = is_assistant and (logprobs_value or allow_training_without_logprobs)
+            if condition_result:
+                last_assistant_index = i
+        elif not isinstance(message, dict):
+            has_logprobs = bool(message.logprobs) if hasattr(message, "logprobs") else False
+            condition_result = has_logprobs or allow_training_without_logprobs
+            if condition_result:
+                last_assistant_index = i
     # If there are no trainable assistant messages, return None
     if last_assistant_index == -1:
         return None
@@ -159,49 +162,74 @@ def tokenize_trajectory(
         if history.tools is not None
         else None
     )
-    chat = cast(
-        str,
-        tokenizer.apply_chat_template(
-            cast(list[dict], messages),
-            tools=tools,  # type: ignore
-            continue_final_message=True,
-            tokenize=False,
-        ),
-    )
-    original_token_ids = cast(
-        list[int],
-        tokenizer.apply_chat_template(
-            cast(list[dict], messages),
-            tools=tools,  # type: ignore
-            continue_final_message=True,
-        ),
-    )
+    try:
+        chat = cast(
+            str,
+            tokenizer.apply_chat_template(
+                cast(list[dict], messages),
+                tools=tools,  # type: ignore
+                continue_final_message=True,
+                tokenize=False,
+            ),
+        )
+    except ValueError as e:
+        # Debug: Print the problematic messages
+        import json
+        print(f"\n{'='*80}")
+        print(f"ERROR in apply_chat_template with continue_final_message=True")
+        print(f"Error: {e}")
+        print(f"Number of messages: {len(messages)}")
+        print(f"Last message: {json.dumps(messages[-1], indent=2)}")
+        if len(messages) >= 2:
+            print(f"Second-to-last message: {json.dumps(messages[-2], indent=2)}")
+        print(f"All messages:")
+        for i, msg in enumerate(messages):
+            print(f"  [{i}] role={msg.get('role')}, content_length={len(str(msg.get('content', '')))}, has_tool_calls={'tool_calls' in msg}")
+        print(f"{'='*80}\n")
+        raise
+    try:
+        original_token_ids = cast(
+            list[int],
+            tokenizer.apply_chat_template(
+                cast(list[dict], messages),
+                tools=tools,  # type: ignore
+                continue_final_message=True,
+            ),
+        )
+    except ValueError as e:
+        # This shouldn't fail if the first call succeeded, but just in case
+        print(f"\nERROR: Second apply_chat_template call failed: {e}")
+        raise
     sentinal_token_id = max(
         set(range(cast(int, tokenizer.vocab_size))) - set(original_token_ids)
     )
     sentinal_token = tokenizer.decode(sentinal_token_id)
-    token_ids = cast(
-        list[int],
-        tokenizer.apply_chat_template(
-            cast(
-                list[dict],
-                [
-                    (
-                        message_or_choice
-                        if isinstance(message_or_choice, dict)
-                        and not message_or_choice["role"] == "assistant"
-                        else {
-                            "role": "assistant",
-                            "content": sentinal_token,
-                        }
-                    )
-                    for message_or_choice in messages_and_choices
-                ],
+    try:
+        token_ids = cast(
+            list[int],
+            tokenizer.apply_chat_template(
+                cast(
+                    list[dict],
+                    [
+                        (
+                            message_or_choice
+                            if isinstance(message_or_choice, dict)
+                            and not message_or_choice["role"] == "assistant"
+                            else {
+                                "role": "assistant",
+                                "content": sentinal_token,
+                            }
+                        )
+                        for message_or_choice in messages_and_choices
+                    ],
+                ),
+                tools=tools,  # type: ignore
+                continue_final_message=True,
             ),
-            tools=tools,  # type: ignore
-            continue_final_message=True,
-        ),
-    )
+        )
+    except ValueError as e:
+        print(f"\nERROR: Third apply_chat_template call (with sentinel) failed: {e}")
+        raise
     assistant_mask: list[int] = [0] * len(token_ids)
     logprobs = [float("nan")] * len(token_ids)
     for message in messages_and_choices:
@@ -214,15 +242,84 @@ def tokenize_trajectory(
         except IndexError:
             end_token_id = None
         if isinstance(message, dict):
-            content = message.get("content")
-            assert isinstance(content, str)
-            content_token_ids = tokenizer.encode(
-                content,
-                add_special_tokens=False,
-            )
-            token_ids[start:end] = content_token_ids
-            logprobs[start:end] = [float("nan")] * len(content_token_ids)
-            assistant_mask[start:end] = [1] * len(content_token_ids)
+            # Check if this dict message has logprobs (Hermes format)
+            if message.get("logprobs"):
+                # Extract logprobs from dict format (same structure as Choice.logprobs)
+                lp_dict = message["logprobs"]
+                # Handle both ChoiceLogprobs object and dict from model_dump()
+                if hasattr(lp_dict, "content"):
+                    # It's a ChoiceLogprobs object - extract content list
+                    token_logprobs = lp_dict.content or lp_dict.refusal or []
+                else:
+                    # It's a dict from model_dump() - extract content list
+                    token_logprobs = lp_dict.get("content") or lp_dict.get("refusal") or []
+
+                # Now token_logprobs is a list of either:
+                # - ChatCompletionTokenLogprob objects (if from ChoiceLogprobs)
+                # - dicts (if from model_dump())
+                # Determine which once and use consistent access pattern
+                is_dict_format = token_logprobs and isinstance(token_logprobs[0], dict)
+
+                # Check for <think> token handling (same as Choice path)
+                if token_logprobs:
+                    first_token_bytes = token_logprobs[0].get("bytes") if is_dict_format else (token_logprobs[0].bytes or [])
+                    if (
+                        first_token_bytes
+                        and bytes(first_token_bytes).decode("utf-8") == "<think>"
+                        and tokenizer.decode(token_ids[start - 4]) == "<think>"
+                    ):
+                        start -= 4
+
+                # Extract token IDs and logprobs
+                if is_dict_format:
+                    # Dict format - use dict accessors
+                    try:
+                        token_ids[start:end] = [
+                            int(tl["token"].split(":")[1])
+                            for tl in token_logprobs
+                        ]
+                    except (IndexError, ValueError, KeyError):
+                        token_ids[start:end] = [
+                            token_id if token_id is not None else tokenizer.eos_token_id
+                            for token_id in tokenizer.convert_tokens_to_ids(
+                                [tl["token"] for tl in token_logprobs]
+                            )
+                        ]
+                    logprobs[start:end] = [tl["logprob"] for tl in token_logprobs]
+                else:
+                    # Object format - use object attributes (same as Choice path below)
+                    try:
+                        token_ids[start:end] = [
+                            int(tl.token.split(":")[1])
+                            for tl in token_logprobs
+                        ]
+                    except (IndexError, ValueError):
+                        token_ids[start:end] = [
+                            token_id if token_id is not None else tokenizer.eos_token_id
+                            for token_id in tokenizer.convert_tokens_to_ids(
+                                [tl.token or tokenizer.eos_token for tl in token_logprobs]
+                            )
+                        ]
+                    logprobs[start:end] = [tl.logprob for tl in token_logprobs]
+
+                assistant_mask[start:end] = [1] * len(token_logprobs)
+
+                # Remove duplicate end token if present (same as Choice path)
+                if token_logprobs and token_ids[start + len(token_logprobs) - 1] == end_token_id:
+                    token_ids.pop(start + len(token_logprobs))
+                    logprobs.pop(start + len(token_logprobs))
+                    assistant_mask.pop(start + len(token_logprobs))
+            else:
+                # No logprobs available - use content text
+                content = message.get("content")
+                assert isinstance(content, str)
+                content_token_ids = tokenizer.encode(
+                    content,
+                    add_special_tokens=False,
+                )
+                token_ids[start:end] = content_token_ids
+                logprobs[start:end] = [float("nan")] * len(content_token_ids)
+                assistant_mask[start:end] = [1] * len(content_token_ids)
         else:
             choice = message
             assert choice.logprobs or allow_training_without_logprobs, (

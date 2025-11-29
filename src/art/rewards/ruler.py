@@ -289,7 +289,13 @@ async def ruler_score_group(
     # Extract message lists and preserve original rewards for comparison
     message_lists: list[list[ChatCompletionMessageParam]] = []
     for traj in new_trajectories:
-        message_lists.append(traj.messages())
+        messages = traj.messages()
+        # Strip logprobs to avoid token bloat in RULER judge
+        cleaned_messages = [
+            {k: v for k, v in msg.items() if k != "logprobs"}
+            for msg in messages
+        ]
+        message_lists.append(cleaned_messages)  # type: ignore[arg-type]
         traj.metrics["independent_reward"] = traj.reward
 
     try:
