@@ -12,6 +12,59 @@ from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from ..trajectories import History, TrajectoryGroup, get_messages
 
 
+def _mask_assistant_tokens_by_special_tokens(
+    token_ids: list[int],
+    tokenizer: "PreTrainedTokenizerBase",
+) -> list[int]:
+    """
+    Create assistant mask by finding <|im_start|>assistant...<|im_end|> sections.
+
+    This approach masks all tokens in assistant messages, including both
+    content (thinking) and tool_calls, which are formatted by the chat template.
+
+    Args:
+        token_ids: Token IDs from apply_chat_template
+        tokenizer: Tokenizer to get special token IDs
+
+    Returns:
+        Binary mask where 1 = train on this token, 0 = skip
+    """
+    assistant_mask = [0] * len(token_ids)
+
+    # Get special tokens
+    im_start_id = tokenizer.convert_tokens_to_ids("<|im_start|>")
+    im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+    assistant_token_ids = tokenizer.encode("assistant", add_special_tokens=False)
+
+    # Find all assistant sections
+    i = 0
+    while i < len(token_ids):
+        if token_ids[i] == im_start_id:
+            # Check if next tokens are "assistant"
+            next_tokens = token_ids[i + 1 : i + 1 + len(assistant_token_ids)]
+            if next_tokens == assistant_token_ids:
+                # Found assistant section start
+                start = i
+                # Find corresponding <|im_end|>
+                end_idx = i + 1
+                while end_idx < len(token_ids) and token_ids[end_idx] != im_end_id:
+                    end_idx += 1
+
+                if end_idx < len(token_ids):
+                    # Mask from <|im_start|> to <|im_end|> inclusive
+                    end = end_idx + 1
+                    assistant_mask[start:end] = [1] * (end - start)
+                    i = end
+                else:
+                    i += 1
+            else:
+                i += 1
+        else:
+            i += 1
+
+    return assistant_mask
+
+
 @dataclass
 class TokenizedResult:
     advantage: float
@@ -121,6 +174,19 @@ def tokenize_trajectory_groups(
         for result in results:
             result.prompt_id = prompt_id
             result.prompt_length = prompt_length
+
+        # Log group-level stats
+        import logging
+        logger = logging.getLogger(__name__)
+        if results:
+            total_group_tokens = sum(len(r.token_ids) for r in results)
+            total_group_masked = sum(sum(r.assistant_mask) for r in results)
+            logger.info(
+                f"Group {group_idx}: {len(results)} trajectories, "
+                f"{total_group_tokens} total tokens, "
+                f"{total_group_masked} masked ({100*total_group_masked/total_group_tokens:.1f}%)"
+            )
+
         if shuffle_group_trajectories:
             random.shuffle(results)
         yield from results
@@ -200,163 +266,35 @@ def tokenize_trajectory(
         # This shouldn't fail if the first call succeeded, but just in case
         print(f"\nERROR: Second apply_chat_template call failed: {e}")
         raise
-    sentinal_token_id = max(
-        set(range(cast(int, tokenizer.vocab_size))) - set(original_token_ids)
-    )
-    sentinal_token = tokenizer.decode(sentinal_token_id)
-    try:
-        token_ids = cast(
-            list[int],
-            tokenizer.apply_chat_template(
-                cast(
-                    list[dict],
-                    [
-                        (
-                            message_or_choice
-                            if isinstance(message_or_choice, dict)
-                            and not message_or_choice["role"] == "assistant"
-                            else {
-                                "role": "assistant",
-                                "content": sentinal_token,
-                            }
-                        )
-                        for message_or_choice in messages_and_choices
-                    ],
-                ),
-                tools=tools,  # type: ignore
-                continue_final_message=True,
-            ),
-        )
-    except ValueError as e:
-        print(f"\nERROR: Third apply_chat_template call (with sentinel) failed: {e}")
-        raise
-    assistant_mask: list[int] = [0] * len(token_ids)
+
+    # Use special-token-based masking (assumes logprobs will be recomputed via precalculate)
+    token_ids = original_token_ids
+    assistant_mask = _mask_assistant_tokens_by_special_tokens(token_ids, tokenizer)
     logprobs = [float("nan")] * len(token_ids)
-    for message in messages_and_choices:
-        if isinstance(message, dict) and not message["role"] == "assistant":
-            continue
-        start = token_ids.index(sentinal_token_id)
-        end = start + 1
-        try:
-            end_token_id = token_ids[end]
-        except IndexError:
-            end_token_id = None
-        if isinstance(message, dict):
-            # Check if this dict message has logprobs (Hermes format)
-            if message.get("logprobs"):
-                # Extract logprobs from dict format (same structure as Choice.logprobs)
-                lp_dict = message["logprobs"]
-                # Handle both ChoiceLogprobs object and dict from model_dump()
-                if hasattr(lp_dict, "content"):
-                    # It's a ChoiceLogprobs object - extract content list
-                    token_logprobs = lp_dict.content or lp_dict.refusal or []
-                else:
-                    # It's a dict from model_dump() - extract content list
-                    token_logprobs = lp_dict.get("content") or lp_dict.get("refusal") or []
 
-                # Now token_logprobs is a list of either:
-                # - ChatCompletionTokenLogprob objects (if from ChoiceLogprobs)
-                # - dicts (if from model_dump())
-                # Determine which once and use consistent access pattern
-                is_dict_format = token_logprobs and isinstance(token_logprobs[0], dict)
+    # Log masking stats for verification
+    total_tokens = len(token_ids)
+    masked_tokens = sum(assistant_mask)
+    tool_call_token_id = tokenizer.convert_tokens_to_ids("<tool_call>")
+    tool_call_positions = [i for i, tid in enumerate(token_ids) if tid == tool_call_token_id]
 
-                # Check for <think> token handling (same as Choice path)
-                if token_logprobs:
-                    first_token_bytes = token_logprobs[0].get("bytes") if is_dict_format else (token_logprobs[0].bytes or [])
-                    if (
-                        first_token_bytes
-                        and bytes(first_token_bytes).decode("utf-8") == "<think>"
-                        and tokenizer.decode(token_ids[start - 4]) == "<think>"
-                    ):
-                        start -= 4
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.info(
+        f"Tokenized trajectory: {total_tokens} tokens, "
+        f"{masked_tokens} masked ({100*masked_tokens/total_tokens:.1f}%), "
+        f"{len(tool_call_positions)} tool calls found"
+    )
 
-                # Extract token IDs and logprobs
-                if is_dict_format:
-                    # Dict format - use dict accessors
-                    try:
-                        token_ids[start:end] = [
-                            int(tl["token"].split(":")[1])
-                            for tl in token_logprobs
-                        ]
-                    except (IndexError, ValueError, KeyError):
-                        token_ids[start:end] = [
-                            token_id if token_id is not None else tokenizer.eos_token_id
-                            for token_id in tokenizer.convert_tokens_to_ids(
-                                [tl["token"] for tl in token_logprobs]
-                            )
-                        ]
-                    logprobs[start:end] = [tl["logprob"] for tl in token_logprobs]
-                else:
-                    # Object format - use object attributes (same as Choice path below)
-                    try:
-                        token_ids[start:end] = [
-                            int(tl.token.split(":")[1])
-                            for tl in token_logprobs
-                        ]
-                    except (IndexError, ValueError):
-                        token_ids[start:end] = [
-                            token_id if token_id is not None else tokenizer.eos_token_id
-                            for token_id in tokenizer.convert_tokens_to_ids(
-                                [tl.token or tokenizer.eos_token for tl in token_logprobs]
-                            )
-                        ]
-                    logprobs[start:end] = [tl.logprob for tl in token_logprobs]
-
-                assistant_mask[start:end] = [1] * len(token_logprobs)
-
-                # Remove duplicate end token if present (same as Choice path)
-                if token_logprobs and token_ids[start + len(token_logprobs) - 1] == end_token_id:
-                    token_ids.pop(start + len(token_logprobs))
-                    logprobs.pop(start + len(token_logprobs))
-                    assistant_mask.pop(start + len(token_logprobs))
+    if tool_call_positions:
+        # Verify tool calls are masked
+        for pos in tool_call_positions:
+            if assistant_mask[pos] == 1:
+                logger.info(f"  ✓ Tool call at position {pos} is masked (mask=1)")
             else:
-                # No logprobs available - use content text
-                content = message.get("content")
-                assert isinstance(content, str)
-                content_token_ids = tokenizer.encode(
-                    content,
-                    add_special_tokens=False,
-                )
-                token_ids[start:end] = content_token_ids
-                logprobs[start:end] = [float("nan")] * len(content_token_ids)
-                assistant_mask[start:end] = [1] * len(content_token_ids)
-        else:
-            choice = message
-            assert choice.logprobs or allow_training_without_logprobs, (
-                "Chat completion choices must have logprobs"
-            )
-            if not choice.logprobs:
-                continue
-            token_logprobs = choice.logprobs.content or choice.logprobs.refusal or []
-            if (
-                bytes(token_logprobs[0].bytes or []).decode("utf-8")
-                == "<think>"
-                == tokenizer.decode(token_ids[start - 4])
-            ):
-                start -= 4
-            try:
-                token_ids[start:end] = (
-                    int(token_logprob.token.split(":")[1])
-                    for token_logprob in token_logprobs
-                )
-            except (IndexError, ValueError):
-                token_ids[start:end] = [  # type: ignore
-                    token_id if token_id is not None else tokenizer.eos_token_id
-                    for token_id in tokenizer.convert_tokens_to_ids(
-                        [
-                            token_logprob.token or tokenizer.eos_token
-                            for token_logprob in token_logprobs
-                        ]
-                    )  # type: ignore
-                ]
-            logprobs[start:end] = (
-                token_logprob.logprob for token_logprob in token_logprobs
-            )
-            assistant_mask[start:end] = [1] * len(token_logprobs)
-            if token_ids[start + len(token_logprobs) - 1] == end_token_id:
-                token_ids.pop(start + len(token_logprobs))
-                logprobs.pop(start + len(token_logprobs))
-                assistant_mask.pop(start + len(token_logprobs))
+                logger.warning(f"  ✗ Tool call at position {pos} NOT masked (mask=0) - BUG!")
+    else:
+        logger.debug("  No tool calls in this trajectory")
     if image_processor:
         images: list[Image.Image] = []
         for message in messages_and_choices:
